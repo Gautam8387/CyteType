@@ -1,16 +1,18 @@
 """Integration tests for CyteType class."""
 
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-from pydantic import ValidationError
 from typing import Any
+from unittest.mock import MagicMock, patch
+
 import anndata
+import pytest
 import scanpy as sc
+from pydantic import ValidationError
 
 from cytetype import CyteType
-from cytetype.api.exceptions import RateLimitError, AuthenticationError
 from cytetype.api import UploadResponse
+from cytetype.api.exceptions import AuthenticationError, RateLimitError
+from cytetype.config import StoredCredentials
 
 
 def test_fixture_works(mock_adata: anndata.AnnData) -> None:
@@ -50,6 +52,52 @@ def test_cytetype_initialization(mock_adata: anndata.AnnData) -> None:
     assert ct.visualization_data["coordinates"] is not None
 
 
+def test_cytetype_initialization_uses_environment_api_url(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CYTETYPE_API_URL",
+        "https://dev.cytetype.example/",
+    )
+
+    ct = CyteType(mock_adata, group_key="leiden")
+
+    assert ct.api_url == "https://dev.cytetype.example"
+
+
+def test_cytetype_api_url_argument_overrides_environment(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CYTETYPE_API_URL", "https://environment.example")
+
+    ct = CyteType(
+        mock_adata,
+        group_key="leiden",
+        api_url="https://explicit.example",
+    )
+
+    assert ct.api_url == "https://explicit.example"
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://example.com",
+        "https://user@example.com",
+        "https://example.com/path",
+        "ftp://example.com",
+    ],
+)
+def test_cytetype_initialization_rejects_unsafe_api_url(
+    mock_adata: anndata.AnnData,
+    api_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="API URL|Non-local"):
+        CyteType(mock_adata, group_key="leiden", api_url=api_url)
+
+
 @pytest.fixture(autouse=True)
 def mock_internal_artifact_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     """Avoid file and network work for run() in tests by mocking internals."""
@@ -82,6 +130,16 @@ def mock_internal_artifact_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("cytetype.main.save_obs_duckdb_file", _save_obs)
     monkeypatch.setattr("cytetype.main.upload_obs_duckdb_file", _upload_obs)
     monkeypatch.setattr("cytetype.main.upload_vars_h5_file", _upload_vars)
+    monkeypatch.setattr(
+        "cytetype.main.load_credentials",
+        lambda api_url: StoredCredentials(
+            apiUrl=api_url,
+            apiToken="stored_test_token",
+            tokenId="stored-token-id",
+            userId="stored-user-id",
+            email="stored@university.edu",
+        ),
+    )
 
 
 def test_cytetype_materializes_canonical_column_from_composite_source(
@@ -182,6 +240,10 @@ def test_cytetype_run_success(
     assert "cytetype_results" in result_adata.uns
     assert "cytetype_jobDetails" in result_adata.uns
     assert result_adata.uns["cytetype_jobDetails"]["job_id"] == "test_job_123"
+    assert (
+        result_adata.uns["cytetype_jobDetails"]["api_url"]
+        == "https://cytetype.nygen.io"
+    )
 
 
 @patch("cytetype.main.wait_for_completion")
@@ -389,16 +451,32 @@ def test_cytetype_get_results_remote(
     mock_fetch: MagicMock,
     mock_adata: anndata.AnnData,
     mock_api_response: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test get_results() fetches from API when not local."""
     mock_fetch.return_value = mock_api_response
+    credential_loader = MagicMock(
+        return_value=StoredCredentials(
+            apiUrl="https://api.test",
+            apiToken="target_test_token",
+            tokenId="target-token-id",
+            userId="target-user-id",
+            email="target@university.edu",
+        )
+    )
+    monkeypatch.setattr("cytetype.main.load_credentials", credential_loader)
 
-    ct = CyteType(mock_adata, group_key="leiden")
+    ct = CyteType(
+        mock_adata,
+        group_key="leiden",
+        api_url="https://trusted.test",
+        auth_token="trusted_test_token",
+    )
 
     # Store job details (simulating previous run)
     ct.adata.uns["cytetype_jobDetails"] = {
         "job_id": "remote_job",
-        "api_url": "https://api.test",
+        "api_url": "https://api.test/",
     }
 
     # Retrieve results (should fetch from API)
@@ -406,7 +484,110 @@ def test_cytetype_get_results_remote(
 
     assert results is not None
     assert results == mock_api_response
+    credential_loader.assert_called_once_with("https://api.test")
     mock_fetch.assert_called_once()
+    fetch_args = mock_fetch.call_args.args
+    assert fetch_args[2] == "https://api.test"
+    assert fetch_args[3] == "target_test_token"
+    assert ct.auth_token == "target_test_token"
+    assert ct._auth_token_api_url == "https://api.test"
+
+
+@patch("cytetype.main.fetch_remote_results")
+def test_cytetype_get_results_legacy_job_uses_instance_api_url(
+    mock_fetch: MagicMock,
+    mock_adata: anndata.AnnData,
+    mock_api_response: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_fetch.return_value = mock_api_response
+    credential_loader = MagicMock()
+    monkeypatch.setattr("cytetype.main.load_credentials", credential_loader)
+    ct = CyteType(
+        mock_adata,
+        group_key="leiden",
+        api_url="https://trusted.test/",
+        auth_token="trusted_test_token",
+    )
+    ct.adata.uns["cytetype_jobDetails"] = {"job_id": "legacy_job"}
+
+    results = ct.get_results()
+
+    assert results == mock_api_response
+    credential_loader.assert_not_called()
+    fetch_args = mock_fetch.call_args.args
+    assert fetch_args[2] == "https://trusted.test"
+    assert fetch_args[3] == "trusted_test_token"
+
+
+def test_cytetype_get_results_rejects_modified_job_url_before_network(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_loader = MagicMock(return_value=None)
+    upload_obs = MagicMock()
+    upload_vars = MagicMock()
+    submit = MagicMock()
+    wait = MagicMock()
+    get_status = MagicMock()
+    fetch_results = MagicMock()
+    monkeypatch.setattr("cytetype.main.load_credentials", credential_loader)
+    monkeypatch.setattr("cytetype.main.upload_obs_duckdb_file", upload_obs)
+    monkeypatch.setattr("cytetype.main.upload_vars_h5_file", upload_vars)
+    monkeypatch.setattr("cytetype.main.submit_annotation_job", submit)
+    monkeypatch.setattr("cytetype.main.wait_for_completion", wait)
+    monkeypatch.setattr("cytetype.core.results.get_job_status", get_status)
+    monkeypatch.setattr("cytetype.core.results.fetch_job_results", fetch_results)
+    ct = CyteType(
+        mock_adata,
+        group_key="leiden",
+        api_url="https://trusted.test",
+        auth_token="trusted_test_token",
+    )
+    ct.adata.uns["cytetype_jobDetails"] = {
+        "job_id": "trusted_job",
+        "api_url": "https://modified.test",
+    }
+
+    with pytest.raises(AuthenticationError, match="cytetype setup"):
+        ct.get_results()
+
+    credential_loader.assert_called_once_with("https://modified.test")
+    upload_obs.assert_not_called()
+    upload_vars.assert_not_called()
+    submit.assert_not_called()
+    wait.assert_not_called()
+    get_status.assert_not_called()
+    fetch_results.assert_not_called()
+
+
+def test_cytetype_get_results_rejects_invalid_job_url_before_credentials(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_loader = MagicMock()
+    get_status = MagicMock()
+    fetch_results = MagicMock()
+    monkeypatch.setattr("cytetype.main.load_credentials", credential_loader)
+    monkeypatch.setattr("cytetype.core.results.get_job_status", get_status)
+    monkeypatch.setattr("cytetype.core.results.fetch_job_results", fetch_results)
+    ct = CyteType(
+        mock_adata,
+        group_key="leiden",
+        api_url="https://trusted.test",
+        auth_token="trusted_test_token",
+    )
+    ct.adata.uns["cytetype_jobDetails"] = {
+        "job_id": "trusted_job",
+        "api_url": "https://modified.test/path",
+    }
+
+    with pytest.raises(ValueError, match="server origin"):
+        ct.get_results()
+
+    credential_loader.assert_not_called()
+    get_status.assert_not_called()
+    fetch_results.assert_not_called()
 
 
 def test_cytetype_initialization_with_auth_token(mock_adata: anndata.AnnData) -> None:
@@ -415,6 +596,7 @@ def test_cytetype_initialization_with_auth_token(mock_adata: anndata.AnnData) ->
 
     assert ct.auth_token == "test_token_123"
     assert ct.api_url == "https://cytetype.nygen.io"
+    assert ct._auth_token_api_url == "https://cytetype.nygen.io"
 
 
 def test_cytetype_no_coordinates(mock_adata: anndata.AnnData) -> None:
@@ -479,6 +661,35 @@ def test_cytetype_run_with_api_url_override(
     assert ct.api_url == "https://override.api"
 
 
+def test_cytetype_run_rejects_unsafe_api_url_before_network(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_loader = MagicMock()
+    upload_obs = MagicMock()
+    upload_vars = MagicMock()
+    submit = MagicMock()
+    wait = MagicMock()
+    monkeypatch.setattr("cytetype.main.load_credentials", credential_loader)
+    monkeypatch.setattr("cytetype.main.upload_obs_duckdb_file", upload_obs)
+    monkeypatch.setattr("cytetype.main.upload_vars_h5_file", upload_vars)
+    monkeypatch.setattr("cytetype.main.submit_annotation_job", submit)
+    monkeypatch.setattr("cytetype.main.wait_for_completion", wait)
+    ct = CyteType(mock_adata, group_key="leiden")
+
+    with pytest.raises(ValueError, match="server origin"):
+        ct.run(
+            study_context="Test",
+            api_url="https://other.example/path",
+        )
+
+    credential_loader.assert_not_called()
+    upload_obs.assert_not_called()
+    upload_vars.assert_not_called()
+    submit.assert_not_called()
+    wait.assert_not_called()
+
+
 def test_cytetype_get_results_no_job_details(mock_adata: anndata.AnnData) -> None:
     """Test get_results() returns None when no job details exist."""
     ct = CyteType(mock_adata, group_key="leiden")
@@ -518,10 +729,91 @@ def test_cytetype_run_with_auth_token_override(
     ct = CyteType(mock_adata, group_key="leiden", auth_token="token_init")
 
     # Run with different auth token
-    ct.run(study_context="Test", auth_token="token_override")
+    ct.run(
+        study_context="Test",
+        api_url="https://override.test/",
+        auth_token="token_override",
+    )
 
     # Verify auth token was updated
     assert ct.auth_token == "token_override"
+    assert ct.api_url == "https://override.test"
+    assert ct._auth_token_api_url == "https://override.test"
+    assert mock_submit.call_args.args[1] == "token_override"
+
+
+@patch("cytetype.main.wait_for_completion")
+@patch("cytetype.main.submit_annotation_job")
+def test_cytetype_run_uses_stored_credentials(
+    mock_submit: MagicMock,
+    mock_wait: MagicMock,
+    mock_adata: anndata.AnnData,
+    mock_api_response: dict[str, Any],
+) -> None:
+    mock_submit.return_value = "job_stored_auth"
+    mock_wait.return_value = mock_api_response
+    ct = CyteType(mock_adata, group_key="leiden")
+
+    ct.run(study_context="Test")
+
+    assert ct.auth_token == "stored_test_token"
+    assert mock_submit.call_args.args[1] == "stored_test_token"
+    assert mock_wait.call_args.args[1] == "stored_test_token"
+
+
+@patch("cytetype.main.wait_for_completion")
+@patch("cytetype.main.submit_annotation_job")
+def test_stored_credentials_are_not_reused_for_another_server(
+    mock_submit: MagicMock,
+    mock_wait: MagicMock,
+    mock_adata: anndata.AnnData,
+    mock_api_response: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def load_for_server(api_url: str) -> StoredCredentials | None:
+        if api_url != "https://cytetype.nygen.io":
+            return None
+        return StoredCredentials(
+            apiUrl=api_url,
+            apiToken="stored_test_token",
+            tokenId="stored-token-id",
+            userId="stored-user-id",
+            email="stored@university.edu",
+        )
+
+    monkeypatch.setattr("cytetype.main.load_credentials", load_for_server)
+    mock_submit.return_value = "job_stored_auth"
+    mock_wait.return_value = mock_api_response
+    ct = CyteType(mock_adata, group_key="leiden")
+    ct.run(study_context="Test")
+
+    with pytest.raises(AuthenticationError, match="cytetype setup"):
+        ct.run(
+            study_context="Test other server",
+            api_url="https://other.example",
+            results_prefix="other",
+        )
+
+    assert mock_submit.call_count == 1
+
+
+def test_cytetype_run_requires_setup_before_upload(
+    mock_adata: anndata.AnnData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload_obs = MagicMock()
+    upload_vars = MagicMock()
+    monkeypatch.setattr("cytetype.main.load_credentials", lambda api_url: None)
+    monkeypatch.setattr("cytetype.main.upload_obs_duckdb_file", upload_obs)
+    monkeypatch.setattr("cytetype.main.upload_vars_h5_file", upload_vars)
+    ct = CyteType(mock_adata, group_key="leiden")
+
+    with pytest.raises(AuthenticationError, match="cytetype setup") as error_info:
+        ct.run(study_context="Test")
+
+    assert error_info.value.error_code == "AUTHENTICATION_REQUIRED"
+    upload_obs.assert_not_called()
+    upload_vars.assert_not_called()
 
 
 @patch("cytetype.main.submit_annotation_job")
